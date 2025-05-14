@@ -1,65 +1,128 @@
-import os
-import fitz  # PyMuPDF
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.docstore.document import Document
-from dotenv import load_dotenv
+# ingest.py
 
-# Load API key from .env
+import os
+import json
+import fitz  # PyMuPDF
+from dotenv import load_dotenv
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.vectorstores import FAISS
+from langchain.prompts import PromptTemplate
+from langchain.docstore.document import Document
+
+# === Setup ===
 load_dotenv()
 openai_api_key = os.getenv("OPENAI_API_KEY")
 
-# === Step 1: Load all text from all PDFs in the folder ===
-def load_all_pdfs_text(folder_path):
-    all_text = ""
-    for filename in os.listdir(folder_path):
-        if filename.endswith(".pdf"):
-            file_path = os.path.join(folder_path, filename)
-            print(f"📄 Reading: {filename}")
-            doc = fitz.open(file_path)
-            for page in doc:
-                all_text += page.get_text()
-    return all_text
+DOCS_DIR = "docs"
+JSON_DIR = "json"
+os.makedirs(JSON_DIR, exist_ok=True)
 
-# === Step 2: Split into chunks (adjust chunk size) ===
-def split_into_chunks(text):
-    # Adjust chunk_size to stay within token limits
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    return splitter.create_documents([text])
+# === Prompt Template ===
+template = """
+You are a helpful assistant extracting key financial fields from U.S. tax documents.
+Extract only the fields that are present, and return them as clean JSON.
 
-# === Step 3: Embed and store chunks (with batching) ===
-def embed_chunks(chunks):
-    # Initialize the embedding model
-    embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+Fields:
+- Adjusted Gross Income (AGI)
+- Total Income
+- Taxable Income
+- Federal Income Tax Withheld
+- Exemptions
+- Wages, Salaries, Tips
+- Rental Income
+- Capital Gains
+- IRA Deduction
+- Student Loan Interest Deduction
+- Refund Amount
+- Tax Year (if found)
 
-    # Break chunks into manageable batches
-    chunk_size = 50  # Adjust based on API limits
-    chunk_batches = [chunks[i:i + chunk_size] for i in range(0, len(chunks), chunk_size)]
+Text:
+{text}
 
-    faiss_index = None
+Return ONLY the JSON.
+"""
 
-    for batch in chunk_batches:
-        batch_texts = [chunk.page_content for chunk in batch]
-        batch_vectors = embeddings.embed_documents(batch_texts)
-        text_embedding_pairs = list(zip(batch_texts, batch_vectors))
+prompt = PromptTemplate(
+    input_variables=["text"],
+    template=template,
+)
 
-        if faiss_index is None:
-            faiss_index = FAISS.from_embeddings(text_embedding_pairs, embeddings)
+llm = ChatOpenAI(temperature=0, model="gpt-4", openai_api_key=openai_api_key)
+chain = prompt | llm
+
+# === Helper Functions ===
+def extract_text_from_pdf(path):
+    doc = fitz.open(path)
+    return "\n".join(page.get_text() for page in doc)
+
+def extract_structured_fields(text):
+    truncated_text = text[:16000]
+    try:
+        response = chain.invoke({"text": truncated_text})
+
+        # The result is an AIMessage object; extract content
+        if hasattr(response, "content"):
+            response_text = response.content
         else:
-            faiss_index.add_embeddings(text_embedding_pairs)
+            response_text = response
 
-    return faiss_index
+        parsed = json.loads(response_text)
 
-# === Step 4: Save Vector Store ===
-def save_vector_store(vstore, path="faiss_index"):
-    vstore.save_local(path)
+        # Ensure all expected fields are included
+        EXPECTED_FIELDS = [
+            "Adjusted Gross Income (AGI)",
+            "Total Income",
+            "Taxable Income",
+            "Federal Income Tax Withheld",
+            "Exemptions",
+            "Wages, Salaries, Tips",
+            "Rental Income",
+            "Capital Gains",
+            "IRA Deduction",
+            "Student Loan Interest Deduction",
+            "Refund Amount",
+            "Tax Year"
+        ]
 
-# === Main Runner ===
-if __name__ == "__main__":
-    folder = "docs"  # Put your PDFs in a folder called "docs"
-    raw_text = load_all_pdfs_text(folder)
-    chunks = split_into_chunks(raw_text)
-    vectorstore = embed_chunks(chunks)
-    save_vector_store(vectorstore)
-    print("✅ All documents ingested and vector store saved.")
+        for field in EXPECTED_FIELDS:
+            if field not in parsed:
+                parsed[field] = None  # This will serialize as `null` in the JSON
+        return parsed        
+    except Exception as e:
+        print("Error extracting fields:", e)
+        return {}
+
+def save_json(data, filename):
+    filepath = os.path.join(JSON_DIR, filename)
+    with open(filepath, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"Saved: {filepath}")
+
+def chunk_for_vectorstore(text, source):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    chunks = splitter.split_text(text)
+    return [Document(page_content=chunk, metadata={"source": source}) for chunk in chunks]
+
+# === Main Process ===
+all_chunks = []
+for fname in os.listdir(DOCS_DIR):
+    if not fname.lower().endswith(".pdf"):
+        continue
+
+    pdf_path = os.path.join(DOCS_DIR, fname)
+    print(f"🧠 Extracting fields from: {fname}")
+    raw_text = extract_text_from_pdf(pdf_path)
+
+    fields = extract_structured_fields(raw_text)
+    base_name = os.path.splitext(fname)[0]
+    save_json(fields, f"{base_name}.json")
+
+    doc_chunks = chunk_for_vectorstore(raw_text, source=base_name)
+    all_chunks.extend(doc_chunks)
+
+# === Save Vector Index for RAG ===
+print("📚 Building vector store...")
+vectorstore = FAISS.from_documents(all_chunks, OpenAIEmbeddings(openai_api_key=openai_api_key))
+vectorstore.save_local("vectorstore")
+print("✅ Vector store saved to ./vectorstore")
